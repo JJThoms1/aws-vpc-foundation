@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euxo pipefail
+
+dnf -y update
+dnf -y install nginx python3 python3-pip awscli amazon-cloudwatch-agent
+systemctl enable nginx
+echo "<h1>ASG Web - $(hostname)</h1>" > /usr/share/nginx/html/index.html
+systemctl start nginx
+
+# CloudWatch Agent config
+mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+{
+  "agent": { "metrics_collection_interval": 60, "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/agent.log" },
+  "metrics": {
+    "append_dimensions": { "AutoScalingGroupName": "${aws:AutoScalingGroupName}" },
+    "metrics_collected": {
+      "cpu": { "resources": ["*"], "measurement": ["cpu_usage_idle","cpu_usage_user","cpu_usage_system"], "totalcpu": true },
+      "mem": { "measurement": ["mem_used_percent"] }
+    }
+  },
+  "logs": {
+    "logs_collected": { "files": { "collect_list": [
+      { "file_path": "/var/log/messages",         "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-messages" },
+      { "file_path": "/var/log/nginx/access.log", "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-access" },
+      { "file_path": "/var/log/nginx/error.log",  "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-error" }
+    ]}}
+  }
+}
+JSON
+
+systemctl enable amazon-cloudwatch-agent
+systemctl start  amazon-cloudwatch-agent
+
+# App placeholder — your Flask/Gunicorn layer can be added later.
+# DB host from Terraform:
+echo "${db_host}" >/opt/app_db_host

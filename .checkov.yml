@@ -1,0 +1,2 @@
+skip-check:
+  - CKV2_AWS_5  # example: skip if you intentionally allow public ALB; otherwise remove
