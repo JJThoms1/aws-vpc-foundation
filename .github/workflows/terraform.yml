@@ -14,66 +14,67 @@ jobs:
       TF_INPUT: false
       TF_CLI_ARGS_init: -upgrade
       AWS_REGION: us-east-1
+      # Use a plugin cache instead of caching .terraform in the repo
+      TF_PLUGIN_CACHE_DIR: ${{ github.workspace }}/.terraform/plugin-cache
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Optional but recommended: cache Terraform plugin dir for faster runs
-      - name: Cache .terraform providers
+      # Optional plugin cache (safe + portable)
+      - name: Cache Terraform plugin cache
         uses: actions/cache@v4
         with:
-          path: |
-            **/.terraform
-            ~/.terraform.d/plugin-cache
-          key: tf-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
+          path: ${{ env.TF_PLUGIN_CACHE_DIR }}
+          key: tfplug-${{ runner.os }}-${{ hashFiles('**/.terraform.lock.hcl') }}
           restore-keys: |
-            tf-${{ runner.os }}-
+            tfplug-${{ runner.os }}-
 
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: 1.9.7
 
-      # Checkov install needs Python; pipx is preinstalled on ubuntu-latest, but ensure python anyway
       - name: Setup Python (for Checkov)
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install linters (tflint + checkov)
+      # TFLint (official action)
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.54.0
+
+      - name: TFLint init
+        run: tflint --init
+
+      - name: TFLint
+        run: tflint
+
+      - name: Install Checkov
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y python3-pip
-          curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install checkov
 
       - name: Terraform fmt
         run: terraform fmt -check -recursive
 
-      # If using Terraform Cloud, keep this step (requires TF_API_TOKEN secret).
-      # If NOT using TFC, you can just run `terraform init` without the env var.
       - name: Terraform init
         run: terraform init
 
       - name: Validate
         run: terraform validate
 
-      - name: tflint
-        run: |
-          tflint --init
-          tflint
-
       - name: checkov
         run: checkov -d .
 
-      # Plan (only on push/workflow_dispatch, not on PR from forks where secrets aren’t available)
+      # Plan only when secrets are available (not from forked PRs)
       - name: Plan
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         env:
-          AWS_ACCESS_KEY_ID: "$secrets.AWS_ACCESS_KEY_ID "
-          AWS_SECRET_ACCESS_KEY: "$secrets.AWS_SECRET_ACCESS_KEY"
-          AWS_SESSION_TOKEN: "$secrets.AWS_SESSION_TOKEN"
+          AWS_ACCESS_KEY_ID:     $secrets.AWS_ACCESS_KEY_ID
+          AWS_SECRET_ACCESS_KEY: $secrets.AWS_SECRET_ACCESS_KEY
+          AWS_SESSION_TOKEN:     $secrets.AWS_SESSION_TOKEN
         run: terraform plan -no-color -out tfplan
 
       - name: Upload plan artifact
