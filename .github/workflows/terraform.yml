@@ -42,11 +42,11 @@ jobs:
 
       - name: Install linters (tflint + checkov)
         run: |
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip
           curl -s https://raw.githubusercontent.com/terraform-linters/tflint/master/install_linux.sh | bash
-          python -m pip install --upgrade pip
-          python -m pip install pipx
-          pipx ensurepath
-          pipx install checkov
+          pip install --upgrade pip
+          pip install checkov
 
       - name: Terraform fmt
         run: terraform fmt -check -recursive
