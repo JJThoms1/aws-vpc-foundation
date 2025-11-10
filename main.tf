@@ -311,7 +311,7 @@ resource "aws_lb_target_group" "web_tg_blue" {
 
   health_check {
     enabled = true
-    path    = "/"
+    path    = var.alb_health_check_path
     matcher = "200-399"
   }
 
@@ -327,7 +327,7 @@ resource "aws_lb_target_group" "web_tg_green" {
 
   health_check {
     enabled = true
-    path    = "/"
+    path    = var.alb_health_check_path
     matcher = "200-399"
   }
 
@@ -413,147 +413,157 @@ resource "aws_launch_template" "web_lt" {
     http_tokens                 = "required"
   }
 
-  # --- INLINE USER DATA (note the closing EOT and ) ) ---
+
+  # --- Inline user data (Flask + Nginx + Secrets + optional CloudWatch Agent) ---
   user_data = base64encode(<<-EOT
     #!/bin/bash
     set -euxo pipefail
 
-    # ---------- Basics ----------
+    ENABLE_CWA="${var.enable_cloudwatch_agent}"
+
+    # IMDSv2 token + region
+    TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+      -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+    REGION=$(curl -sS -H "X-aws-ec2-metadata-token: $TOKEN" \
+      http://169.254.169.254/latest/dynamic/instance-identity/document | awk -F'"' '/region/ {print $4}')
+
+    # Basics
     dnf -y update
     dnf -y install nginx python3 python3-pip awscli
     python3 -m pip install --upgrade pip
     python3 -m pip install flask pymysql boto3 gunicorn
 
-    # ---------- Inputs from Terraform ----------
-    DB_HOST="$${aws_db_instance.mysql.address}"
+    # DB host from Terraform (plan-time)
+    DB_HOST="${aws_db_instance.mysql.address}"
 
-    # ---------- Fetch DB credentials from Secrets Manager (with IMDSv2)----------
-    TOKEN=$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
-    -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
-    REGION="$(curl -s http://169.254.169.254/latest/dynamic/instance-identity/document | awk -F'"' '/region/ {print $4}')"
+    # Fetch DB creds from Secrets Manager (handle name_prefix)
     SECRET_NAME="vpc-foundation-db-credentials"
-    SECRET_ID="$(aws secretsmanager list-secrets --region "$REGION" \
+    SECRET_ID=$(aws secretsmanager list-secrets --region "$REGION" \
       --filters Key=name,Values=$SECRET_NAME \
-      --query 'SecretList | sort_by(@, &LastChangedDate)[-1].Name' --output text || true)"
+      --query 'SecretList | sort_by(@, &LastChangedDate)[-1].Name' --output text || true)
     if [ -z "$SECRET_ID" ] || [ "$SECRET_ID" = "None" ]; then
-      SECRET_ID="$(aws secretsmanager list-secrets --region "$REGION" \
-        --query "SecretList[?starts_with(Name, '$SECRET_NAME')].Name | [-1]" --output text || true)"
+      SECRET_ID=$(aws secretsmanager list-secrets --region "$REGION" \
+        --query "SecretList[?starts_with(Name, '$SECRET_NAME')].Name | [-1]" --output text || true)
     fi
-    SECRET_JSON="$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET_ID" --query SecretString --output text || echo '{}')"
+    SECRET_JSON=$(aws secretsmanager get-secret-value --region "$REGION" \
+      --secret-id "$SECRET_ID" --query SecretString --output text || echo '{}')
 
-    DB_USER="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("username",""))')"
-    DB_PASS="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("password",""))')"
-    DB_NAME="$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("dbname",""))')"
+    DB_USER=$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("username",""))')
+    DB_PASS=$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("password",""))')
+    DB_NAME=$(echo "$SECRET_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("dbname",""))')
 
-    # ---------- App files ----------
+    # App files
     mkdir -p /opt/app
 
     cat >/opt/app/app.py <<'PY'
-import os
-from flask import Flask
-import pymysql
+    import os
+    from flask import Flask
+    import pymysql
 
-app = Flask(__name__)
+    app = Flask(__name__)
 
-DB_HOST = os.getenv("DB_HOST")
-DB_USER = os.getenv("DB_USER")
-DB_PASS = os.getenv("DB_PASS")
-DB_NAME = os.getenv("DB_NAME")
+    DB_HOST = os.getenv("DB_HOST")
+    DB_USER = os.getenv("DB_USER")
+    DB_PASS = os.getenv("DB_PASS")
+    DB_NAME = os.getenv("DB_NAME")
 
-def get_conn():
-    return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, connect_timeout=5)
+    def get_conn():
+        return pymysql.connect(host=DB_HOST, user=DB_USER, password=DB_PASS, database=DB_NAME, connect_timeout=5)
 
-@app.route("/")
-def index():
-    try:
-        conn = get_conn()
-        with conn.cursor() as cur:
-            cur.execute("CREATE TABLE IF NOT EXISTS hello (id INT PRIMARY KEY, msg VARCHAR(100))")
-            cur.execute("INSERT IGNORE INTO hello (id, msg) VALUES (1, 'Hello from ASG via RDS!')")
-            cur.execute("SELECT id, msg FROM hello ORDER BY id LIMIT 5")
-            rows = cur.fetchall()
-        conn.commit()
-        conn.close()
-        rows_html = "<br>".join([f"{r[0]}: {r[1]}" for r in rows])
-        return f"<h1>OK: ALB → Web (ASG) → RDS</h1><p>{rows_html}</p>"
-    except Exception as e:
-        return f"<h1>Error</h1><pre>{e}</pre>", 500
-PY
+    @app.route("/")
+    def index():
+        try:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("CREATE TABLE IF NOT EXISTS hello (id INT PRIMARY KEY, msg VARCHAR(100))")
+                cur.execute("INSERT IGNORE INTO hello (id, msg) VALUES (1, 'Hello from ASG via RDS!')")
+                cur.execute("SELECT id, msg FROM hello ORDER BY id LIMIT 5")
+                rows = cur.fetchall()
+            conn.commit()
+            conn.close()
+            rows_html = "<br>".join([f"{r[0]}: {r[1]}" for r in rows])
+            return f"<h1>OK: ALB → Web (ASG) → RDS</h1><p>{rows_html}</p>"
+        except Exception as e:
+            return f"<h1>Error</h1><pre>{e}</pre>", 500
+    PY
 
-    # Env file (double-dollar to avoid Terraform interpolation)
+    # Env for systemd (note $$ to escape Terraform interpolation)
     cat >/opt/app/app.env <<ENV
-DB_HOST=$${DB_HOST}
-DB_USER=$${DB_USER}
-DB_PASS=$${DB_PASS}
-DB_NAME=$${DB_NAME}
-PYTHONUNBUFFERED=1
-ENV
+    DB_HOST=$${DB_HOST}
+    DB_USER=$${DB_USER}
+    DB_PASS=$${DB_PASS}
+    DB_NAME=$${DB_NAME}
+    PYTHONUNBUFFERED=1
+    ENV
     chmod 600 /opt/app/app.env
 
     # Gunicorn service
     cat >/etc/systemd/system/app.service <<'UNIT'
-[Unit]
-Description=Flask app (Gunicorn)
-After=network.target
+    [Unit]
+    Description=Flask app (Gunicorn)
+    After=network.target
 
-[Service]
-EnvironmentFile=/opt/app/app.env
-WorkingDirectory=/opt/app
-ExecStart=/usr/local/bin/gunicorn --bind 127.0.0.1:5000 app:app
-Restart=always
-User=root
+    [Service]
+    EnvironmentFile=/opt/app/app.env
+    WorkingDirectory=/opt/app
+    ExecStart=/usr/local/bin/gunicorn --bind 127.0.0.1:5000 app:app
+    Restart=always
+    User=root
 
-[Install]
-WantedBy=multi-user.target
-UNIT
+    [Install]
+    WantedBy=multi-user.target
+    UNIT
 
-    # Nginx reverse proxy
+    # Nginx reverse proxy (escape $ with $$)
     cat >/etc/nginx/conf.d/flask.conf <<'NGX'
-server {
-    listen 80 default_server;
-    server_name _;
-    location / {
-        proxy_pass         http://127.0.0.1:5000;
-        proxy_http_version 1.1;
-        proxy_set_header   Host $$host;
-        proxy_set_header   X-Real-IP $$remote_addr;
-        proxy_set_header   X-Forwarded-For $$proxy_add_x_forwarded_for;
-        proxy_set_header   X-Forwarded-Proto $$scheme;
+    server {
+        listen 80 default_server;
+        server_name _;
+        location / {
+            proxy_pass         http://127.0.0.1:5000;
+            proxy_http_version 1.1;
+            proxy_set_header   Host $$host;
+            proxy_set_header   X-Real-IP $$remote_addr;
+            proxy_set_header   X-Forwarded-For $$proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Proto $$scheme;
+        }
     }
-}
-NGX
+    NGX
 
     rm -f /usr/share/nginx/html/index.html || true
 
-    # CloudWatch Agent
-    mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
-    cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
-{
-  "agent": { "metrics_collection_interval": 60, "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/agent.log" },
-  "metrics": {
-    "append_dimensions": { "AutoScalingGroupName": "$${aws:AutoScalingGroupName}" },
-    "metrics_collected": {
-      "cpu": { "resources": ["*"], "measurement": ["cpu_usage_idle","cpu_usage_user","cpu_usage_system"], "totalcpu": true },
-      "mem": { "measurement": ["mem_used_percent"] }
-    }
-  },
-  "logs": {
-    "logs_collected": { "files": { "collect_list": [
-      { "file_path": "/var/log/messages",         "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-messages" },
-      { "file_path": "/var/log/nginx/access.log", "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-access" },
-      { "file_path": "/var/log/nginx/error.log",  "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-error" }
-    ]}}
-  }
-}
-JSON
-    dnf -y install amazon-cloudwatch-agent
-    systemctl enable amazon-cloudwatch-agent
+    # Optional CloudWatch Agent
+    if [ "$ENABLE_CWA" = "true" ]; then
+      mkdir -p /opt/aws/amazon-cloudwatch-agent/etc
+      cat >/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'JSON'
+      {
+        "agent": { "metrics_collection_interval": 60, "logfile": "/opt/aws/amazon-cloudwatch-agent/logs/agent.log" },
+        "metrics": {
+          "append_dimensions": { "AutoScalingGroupName": "$${aws:AutoScalingGroupName}" },
+          "metrics_collected": {
+            "cpu": { "resources": ["*"], "measurement": ["cpu_usage_idle","cpu_usage_user","cpu_usage_system"], "totalcpu": true },
+            "mem": { "measurement": ["mem_used_percent"] }
+          }
+        },
+        "logs": {
+          "logs_collected": { "files": { "collect_list": [
+            { "file_path": "/var/log/messages",         "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-messages" },
+            { "file_path": "/var/log/nginx/access.log", "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-access" },
+            { "file_path": "/var/log/nginx/error.log",  "log_group_name": "/vpc-foundation/web", "log_stream_name": "{instance_id}-nginx-error" }
+          ]}}
+        }
+      }
+      JSON
+      dnf -y install amazon-cloudwatch-agent
+      systemctl enable amazon-cloudwatch-agent
+      systemctl start  amazon-cloudwatch-agent
+    fi
 
+    # Start services
     systemctl daemon-reload
     systemctl enable nginx app
     systemctl restart nginx
     systemctl start app
-    systemctl start amazon-cloudwatch-agent
   EOT
   )
 
